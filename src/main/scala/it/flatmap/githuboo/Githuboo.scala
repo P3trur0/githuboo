@@ -2,9 +2,12 @@ package it.flatmap.githuboo
 
 import java.nio.charset.StandardCharsets.UTF_8
 
-import gigahorse.{HeaderNames, MimeTypes, Request}
+import gigahorse.{FullResponse, HeaderNames, MimeTypes, Request}
 import gigahorse.support.asynchttpclient.Gigahorse
 import spray.json._
+
+import scala.concurrent.Await
+import scala.concurrent.duration._
 
 sealed trait GithubooCommand
 
@@ -16,18 +19,42 @@ homepage: String,
 has_issues: Boolean = true,
 has_projects: Boolean = false,
 has_wiki: Boolean = true,
-auto_init: Boolean = false,
+auto_init: Boolean = true,
 gitignore_template: String = "Scala",
 license_template: String = "mit",
 allow_squash_merge: Boolean = true,
 allow_merge_commit: Boolean = true,
 allow_rebase_merge: Boolean = true) extends GithubooCommand
+
 case class DeleteProject() extends GithubooCommand
 
 object CreateProjectProtocol extends DefaultJsonProtocol {
   implicit val commandFormat = jsonFormat13(CreateProject)
 }
 
+object JSONUtility {
+
+  trait Serializer[T] {
+    def serialize(t: T): String
+  }
+
+  object Serializer {
+    implicit object CreateProjectSerializer extends Serializer[CreateProject] {
+      def serialize(createProject: CreateProject): String = {
+        import CreateProjectProtocol._
+        createProject.toJson.prettyPrint
+      }
+    }
+  }
+}
+
+object JsonSerializer {
+  import JSONUtility.Serializer
+  def serialize[T: Serializer](t: T): String = {
+    val engine = implicitly[Serializer[T]]
+    engine.serialize(t)
+  }
+}
 
 sealed trait GithubooEvent
 case class ProjectCreated(name: String) extends GithubooEvent
@@ -60,7 +87,6 @@ abstract class AbstractClient {
   def apply(builder: RequestBuilder): Request =
     complete(builder.build)
 }
-case class NoAuthClient() extends AbstractClient
 
 case class OAuthClient(token: String) extends AbstractClient {
   override def httpHeaders: Map[String, String] =
@@ -68,16 +94,37 @@ case class OAuthClient(token: String) extends AbstractClient {
   override def toString: String = s"OAuthClient(****)"
 }
 
-object OAuthClient {
-  def apply(token: String): OAuthClient = OAuthClient(token)
-}
-
 trait Githuboo {
-  def createGitHubProject(name: String): Option[ProjectCreated] = {None}
-  def deleteGitHubProject(name: String): Option[ProjectDeleted] = {None}
+
+  def client: AbstractClient
+
+  private def runOperation[A](request: RequestBuilder): FullResponse = {
+    Gigahorse.withHttp(Gigahorse.config) { http =>
+      val f = http.run(client(request))
+      Await.result(f, 20.seconds)
+    }
+  }
+
+  def createGitHubProject(bodyPayload: CreateProject): Option[ProjectCreated] = {
+    val response = runOperation(CreateRepo(bodyPayload, bodyPayload.name))
+    response.status match {
+      case 201 => Some(ProjectCreated(response.header("Location").getOrElse("Invalid Location")))
+      case _ => None
+    }
+  }
+
+  def deleteGitHubProject(projectOwner: String, projectName: String): Option[ProjectDeleted] = {
+    val response = runOperation(DeleteRepo(projectOwner, projectName))
+    response.status match {
+      case 204 => Some(ProjectDeleted(projectName))
+      case _ => None
+    }
+  }
 }
 
-object Main extends App {
-  import CreateProjectProtocol._
-  println(CreateProject(name="Pippo", description="Pluto", homepage = "Topolino").toJson.prettyPrint)
+object Main extends App with Githuboo {
+  val client = OAuthClient(System.getenv("GITHUB_TOKEN"))
+  deleteGitHubProject("P3trur0", "Pippo")
 }
+
+
